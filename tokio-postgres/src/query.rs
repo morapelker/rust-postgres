@@ -79,6 +79,17 @@ pub async fn query_portal(
 }
 
 /// Extract the number of rows affected from [`CommandCompleteBody`].
+pub fn extract_response(body: &CommandCompleteBody) -> Result<Vec<Option<u64>>, Error> {
+    let rows = body
+        .tag()
+        .map_err(Error::parse)?
+        .split(' ')
+        .map(|x| x.parse().ok())
+        .collect();
+    Ok(rows)
+}
+
+/// Extract the number of rows affected from [`CommandCompleteBody`].
 pub fn extract_row_affected(body: &CommandCompleteBody) -> Result<u64, Error> {
     let rows = body
         .tag()
@@ -89,6 +100,43 @@ pub fn extract_row_affected(body: &CommandCompleteBody) -> Result<u64, Error> {
         .parse()
         .unwrap_or(0);
     Ok(rows)
+}
+
+pub async fn execute_multi_response<P, I>(
+    client: &InnerClient,
+    statement: Statement,
+    params: I,
+) -> Result<Vec<Option<u64>>, Error>
+where
+    P: BorrowToSql,
+    I: IntoIterator<Item = P>,
+    I::IntoIter: ExactSizeIterator,
+{
+    let buf = if log_enabled!(Level::Debug) {
+        let params = params.into_iter().collect::<Vec<_>>();
+        debug!(
+            "executing statement {} with parameters: {:?}",
+            statement.name(),
+            BorrowToSqlParamsDebug(params.as_slice()),
+        );
+        encode(client, &statement, params)?
+    } else {
+        encode(client, &statement, params)?
+    };
+    let mut responses = start(client, buf).await?;
+
+    let mut rows = Vec::new();
+    loop {
+        match responses.next().await? {
+            Message::DataRow(_) => {}
+            Message::CommandComplete(body) => {
+                rows = extract_response(&body)?;
+            }
+            Message::EmptyQueryResponse => {}
+            Message::ReadyForQuery(_) => return Ok(rows),
+            _ => return Err(Error::unexpected_message()),
+        }
+    }
 }
 
 pub async fn execute<P, I>(
